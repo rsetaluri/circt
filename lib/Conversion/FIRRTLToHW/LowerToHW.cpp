@@ -3502,7 +3502,36 @@ LogicalResult FIRRTLLowering::visitExpr(MultibitMuxOp op) {
     loweredInputs.push_back(lowered);
   }
   Value array = builder.create<hw::ArrayCreateOp>(loweredInputs);
-  Value inBoundsRead = builder.create<hw::ArrayGetOp>(array, index);
+  Value inBoundsRead;
+  if (true) {
+    // %wire_array = sv.wire : array_type
+    // sv.assign %wire_array, hw.array_create(...);
+    // %wire_array_read = sv.read_inout %wire_array
+    // %wire_val = sv.wire : elem_type
+    // sv.assign %wire_val, sv.verbatim.expr "{{0}}[{{1}}] /* foo */; bar"
+    // return sv.read_inout %wire_val
+    auto moduleName = cast<hw::HWModuleOp>(op->getParentOp()).getName();
+    StringAttr symName = builder.getStringAttr(moduleNamespace.newName(
+        Twine("__") + moduleName + Twine("__MUX_ARRAY")));
+
+    auto arrayWire = builder.create<sv::WireOp>(
+        array.getType(), builder.getStringAttr("GEN_multibit_mux"), symName);
+    builder.create<sv::AssignOp>(arrayWire, array);
+    StringAttr valName = builder.getStringAttr(
+        moduleNamespace.newName(Twine("__") + moduleName + Twine("__MUX_VAL")));
+    auto valWire = builder.create<sv::WireOp>(
+        lowerType(op.getType()), builder.getStringAttr("GEN_multibit_get"));
+    ValueRange range{builder.create<sv::ReadInOutOp>(arrayWire), index};
+    auto arrayGetWithMetaComment = builder.create<sv::VerbatimExprOp>(
+        lowerType(op.getType()),
+        "{{0}}[{{1}}] /* cadence map_to_mux */; /* synopsys infer_mux_override "
+        "*/",
+        range);
+    builder.create<sv::AssignOp>(valWire, arrayGetWithMetaComment);
+    inBoundsRead = builder.create<sv::ReadInOutOp>(valWire);
+  } else {
+    inBoundsRead = builder.create<hw::ArrayGetOp>(array, index);
+  }
 
   // If the multi-bit mux can never have an out-of-bounds read, then lower it
   // into a HW multi-bit mux.
