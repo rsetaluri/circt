@@ -258,9 +258,11 @@ struct CircuitLoweringState {
   std::atomic<bool> used_RANDOMIZE_GARBAGE_ASSIGN{false};
 
   CircuitLoweringState(CircuitOp circuitOp, bool enableAnnotationWarning,
+                       bool addPragmasToMultibitMux,
                        InstanceGraph *instanceGraph, NLATable *nlaTable)
       : circuitOp(circuitOp), instanceGraph(instanceGraph),
-        enableAnnotationWarning(enableAnnotationWarning), nlaTable(nlaTable) {
+        enableAnnotationWarning(enableAnnotationWarning),
+        addPragmasToMultibitMux(addPragmasToMultibitMux), nlaTable(nlaTable) {
     auto *context = circuitOp.getContext();
 
     // Get the testbench output directory.
@@ -352,6 +354,9 @@ private:
   StringSet<> pendingAnnotations;
   const bool enableAnnotationWarning;
   std::mutex annotationPrintingMtx;
+
+  // If true, lower multibit mux to array index access annotated with pragma.
+  const bool addPragmasToMultibitMux;
 
   // Records any sv::BindOps that are found during the course of execution.
   // This is unsafe to access directly and should only be used through addBind.
@@ -446,6 +451,7 @@ struct FIRRTLModuleLowering : public LowerFIRRTLToHWBase<FIRRTLModuleLowering> {
 
   void runOnOperation() override;
   void setEnableAnnotationWarning() { enableAnnotationWarning = true; }
+  void setAddPragmasToMultibixMux() { addPragmasToMultibitMux = true; }
 
 private:
   void lowerFileHeader(CircuitOp op, CircuitLoweringState &loweringState);
@@ -475,10 +481,13 @@ private:
 
 /// This is the pass constructor.
 std::unique_ptr<mlir::Pass>
-circt::createLowerFIRRTLToHWPass(bool enableAnnotationWarning) {
+circt::createLowerFIRRTLToHWPass(bool enableAnnotationWarning,
+                                 bool addPragmaToMultibixMux) {
   auto pass = std::make_unique<FIRRTLModuleLowering>();
   if (enableAnnotationWarning)
     pass->setEnableAnnotationWarning();
+  if (addPragmaToMultibixMux)
+    pass->setAddPragmasToMultibixMux();
   return pass;
 }
 
@@ -504,9 +513,9 @@ void FIRRTLModuleLowering::runOnOperation() {
 
   // Keep track of the mapping from old to new modules.  The result may be null
   // if lowering failed.
-  CircuitLoweringState state(circuit, enableAnnotationWarning,
-                             &getAnalysis<InstanceGraph>(),
-                             &getAnalysis<NLATable>());
+  CircuitLoweringState state(
+      circuit, enableAnnotationWarning, addPragmasToMultibitMux,
+      &getAnalysis<InstanceGraph>(), &getAnalysis<NLATable>());
 
   SmallVector<FModuleOp, 32> modulesToProcess;
 
@@ -3503,31 +3512,44 @@ LogicalResult FIRRTLLowering::visitExpr(MultibitMuxOp op) {
   }
   Value array = builder.create<hw::ArrayCreateOp>(loweredInputs);
   Value inBoundsRead;
-  if (true) {
-    // %wire_array = sv.wire : array_type
-    // sv.assign %wire_array, hw.array_create(...);
-    // %wire_array_read = sv.read_inout %wire_array
-    // %wire_val = sv.wire : elem_type
-    // sv.assign %wire_val, sv.verbatim.expr "{{0}}[{{1}}] /* foo */; bar"
-    // return sv.read_inout %wire_val
-    auto moduleName = cast<hw::HWModuleOp>(op->getParentOp()).getName();
-    StringAttr symName = builder.getStringAttr(moduleNamespace.newName(
+
+  if (circuitState.addPragmasToMultibitMux) {
+    // If addPragmasToMultibitMux is true, we lower a multibit mux into an array
+    // access annotated with pragmas, "cadence map_to_mux" and "synopsys
+    // infer_mux_override". More concretely, we want to annotate array indexing
+    // in the following way.
+    // ```
+    // wire val;
+    // assign val = array[sel] /* cadence map_to_mux */; /* synopsys
+    // infer_mux_override */
+    // ```
+    // Those pragmas are very sensitive to their positions so we cannot
+    // simply use hw.array_get op. So currently sv.verbatim is used
+    // to embed assignment, array indexing and pragmas.
+    //
+
+    auto moduleName = theModule.getName();
+    StringAttr arraySymName = builder.getStringAttr(moduleNamespace.newName(
         Twine("__") + moduleName + Twine("__MUX_ARRAY")));
 
     auto arrayWire = builder.create<sv::WireOp>(
-        array.getType(), builder.getStringAttr("GEN_multibit_mux"), symName);
+        array.getType(), builder.getStringAttr(""), arraySymName);
     builder.create<sv::AssignOp>(arrayWire, array);
-    StringAttr valName = builder.getStringAttr(
+
+    auto type = lowerType(op.getType());
+    StringAttr valSymName = builder.getStringAttr(
         moduleNamespace.newName(Twine("__") + moduleName + Twine("__MUX_VAL")));
-    auto valWire = builder.create<sv::WireOp>(
-        lowerType(op.getType()), builder.getStringAttr("GEN_multibit_get"));
-    ValueRange range{builder.create<sv::ReadInOutOp>(arrayWire), index};
-    auto arrayGetWithMetaComment = builder.create<sv::VerbatimExprOp>(
-        lowerType(op.getType()),
-        "{{0}}[{{1}}] /* cadence map_to_mux */; /* synopsys infer_mux_override "
-        "*/",
-        range);
-    builder.create<sv::AssignOp>(valWire, arrayGetWithMetaComment);
+    auto valWire =
+        builder.create<sv::WireOp>(type, builder.getStringAttr(""), valSymName);
+
+    builder.create<sv::VerbatimOp>(
+        "assign {{2}} = {{1}}[{{0}}] /* cadence map_to_mux */; /* synopsys "
+        "infer_mux_override */",
+        ValueRange{index},
+        builder.getArrayAttr({hw::InnerRefAttr::get(theModule.getNameAttr(),
+                                                    arrayWire.inner_symAttr()),
+                              hw::InnerRefAttr::get(theModule.getNameAttr(),
+                                                    valWire.inner_symAttr())}));
     inBoundsRead = builder.create<sv::ReadInOutOp>(valWire);
   } else {
     inBoundsRead = builder.create<hw::ArrayGetOp>(array, index);
